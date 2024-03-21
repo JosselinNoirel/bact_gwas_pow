@@ -1,0 +1,142 @@
+---
+title: "Power analysis and bacterial population sizes"
+author: "Josselin Noirel, Antoine Bridier-Nahmias"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r Setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, comment=NULL)
+```
+
+```{r Libraries, message=FALSE, warning=FALSE}
+library('tidyverse')
+theme_set(theme_bw())
+set.seed(123)
+```
+
+## Background
+
+We establish a simple, additive genotype-phenotype relationship in a bacterial population based on polymorphic genes.  The genes are assumed to be in linkage equilibrium and there is no genetic interaction in our model.  We estimate the size of the population necessary to detect the associations.
+
+## Parametrisation of the genotype-phenotype relationship
+
+Let's assume we have $n$ causal genes among $N$ bi-allelic genes.
+
+```{r Parameters}
+n = 30             # Number of causal genes
+N = 5000           # Number of genes to be tested; N >= n (N - n non causal)
+```
+
+We'll assume a simple, additive genotype-phenotype relationship in a bacterium.  In this context, the genetic architecture is defined by the allele frequency and the penetrance of each polymorphic gene.  We assume that there is no linkage  We denote each causal gene has a MAF $f_i$ and an effect size $\beta_i$.
+
+One simple genetic architecture could assume identical MAFs and identical $\beta_i$'s.
+
+```{r, eval=FALSE}
+f = rep(.25, n)    # Minor allele frequency (let's assume constant)
+beta = rep(1, n)   # Identical, arbitrary effect size for all genes
+```
+
+Another genetic architecture could assume a mixture of rare and common variants and a spectrum of $\beta_i$'s.
+
+```{r}
+f = rep(c(.01, .2), times=n/2) # Rare and common SNPs
+beta = 1:n         # Mixture of effect sizes
+```
+
+Note that the magnitude of the effect sizes $\beta_i$'s is determined up to a constant multiplier (so that `beta = rep(1, n)` and `beta = rep(10, n)` mean the same thing).
+
+We model a quantitative phenotype $Y$ through an additive relationship
+\[ Y = \sum \beta_i d_i + \epsilon \]
+where $d_i$ (0 or 1) denotes the $i$-th genotype (presence/absence of gene) $\epsilon$ is a normal distribution with a mean of zero and variance of $\sigma^2$; it captures the part of the phenotype that is determined by unaccounted-for variables (be they genetic, environmental or otherwise) as well as the part of the phenotype that is, for all intents and purposes, purely stochastic.
+\[\bar{Y} = \sum \beta_i f_i \quad
+  V(Y)    = \sum \beta_i f_i (1 - f_i) + \sigma^2 \]
+
+Narrow-sense heritability is given by \[ h^2 = \frac{\sum \beta_i f_i (1 - f_i)}{V(Y)} \]
+
+For this phenotype, we assume a fairly sizeable amount of heritability $h^2 = 50$% but other choices (20%, 10%) would be reasonable too but unsurprisingly more challenging to address.
+
+```{r}
+h2 = .5
+```
+
+The amount of noise, $\sigma^2$, can be determined based on the assumed value for $h^2$:
+\[ \sigma^2 = \frac{1 - h^2}{h^2} \Bigl( \sum \beta_i f_i (1 - f_i) \Bigl) \]
+
+```{r}
+vg = sum(beta^2 * f * (1 - f)) # Genetic variation
+s2 = (1 - h2)/h2 * vg          # \sigma^2
+vt = vg + s2                   # Total phenotypic variation
+sigma  = sqrt(s2)              # \sigma
+```
+
+```{r Cumulative h2}
+tibble(h2=beta^2 * f * (1 - f)) %>%
+  arrange(desc(h2)) %>%
+  mutate(cumh2=cumsum(h2), relh2=cumh2/sum(h2),
+         k=1:n) %>%
+  ggplot(aes(k, relh2)) +
+  geom_segment(aes(xend=k), yend=0, colour='gray', linewidth=2) +
+  geom_point() +
+  ggtitle('Relative h^2 cumulatively contained in each gene') +
+  ylim(0, 1)
+```
+
+## Power calculation
+
+Suppose, we wish to attain $P = 80$% power in the sense of detecting *at least one gene*; this means that the power must be adjusted:
+
+```{r}
+alpha = .05
+fdr_thr = .5
+P = .8 # Capital "P"
+P = 1 - (1 - P)^(1/n)
+```
+
+This means that we must detect an individual gene with probability $1 - (1 - P)^{1/n} \approx `r round(100 * P)`$% for $n = `r n`$ *if we assume that the genotypes are independent*.  We compute
+
+```{r}
+sizes = map(1:n,
+            \(i) power.t.test(n=NULL,
+                              delta=beta[i],
+                              sd=sqrt(s2 + sum(beta[-i]^2 * f[-i] * (1 - f[-i]))),
+                              sig.level=alpha/N,
+                              power=P)) |>
+  map_dbl('n') |>
+  map_int(round)
+```
+
+```{r}
+tibble(sizes) %>%
+  arrange(sizes) %>%
+  mutate(k=1:n) %>%
+  ggplot(aes(k, sizes)) +
+  geom_point() +
+  ggtitle('Group size required computed from power calculations for each gene') +
+  scale_y_log10()
+```
+
+`power.t.test()` assumes two groups of identical sizes but this won't be the case here because the MAF $f_i \neq .5$.
+
+But the effective group size for two unequal group sizes $n_1$ and $n_2$ is given (IIRC) by
+\[ n^* = 2 \frac{n_1 n_2}{n_1 + n_2} \]
+Applying this to groups of size $n_1 \propto f_i$ and $n_2 \propto 1 - f_i$ we get
+\[ K = \frac{n^*}{2 f_i (1 - f_i)} \]
+
+Another way to look at it is to consider that $K = n^*/f_i`$ conservatively.
+
+The population size depends on the gene:
+
+```{r}
+K = map2_dbl(sizes, f, \(n, f) n/(2 * f * (1 - f))) |>
+  map_int(round)
+```
+
+```{r}
+tibble(sizes=K) %>%
+  mutate(k=1:n) %>%
+  ggplot(aes(k, sizes)) +
+  geom_point() +
+  ggtitle('Group size required computed from power calculations for each gene') +
+  scale_y_log10()
+```

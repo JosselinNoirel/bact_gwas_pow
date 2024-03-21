@@ -1,0 +1,208 @@
+---
+title: "Power analysis and bacterial population sizes"
+author: "Josselin Noirel, Antoine Bridier-Nahmias"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r Setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, comment=NULL)
+```
+
+```{r Libraries, message=FALSE, warning=FALSE}
+library('foreach')
+library('doParallel')
+library('tidyverse')
+
+library('lemon')
+knit_print.data.frame <- lemon_print
+
+theme_set(theme_bw())
+set.seed(123)
+
+registerDoParallel(cores=16)
+```
+
+## Background
+
+We establish a simple, additive genotype-phenotype relationship in a bacterial population based on polymorphic genes.  The genes are assumed to be in linkage equilibrium and there is no genetic interaction in our model.   Given a certain population size, we simulate data to estimate how many true associations get detected.
+
+## Parametrisation of the genotype-phenotype relationship
+
+Let's assume we have $n$ causal genes among $N$ bi-allelic genes.
+
+```{r Parameters}
+n = 30             # Number of causal genes
+N = 5000           # Number of genes to be tested; N >= n (N - n non causal)
+```
+
+We'll assume a simple, additive genotype-phenotype relationship in a bacterium.  In this context, the genetic architecture is defined by the allele frequency and the penetrance of each polymorphic gene.  We assume that there is no linkage  We denote each causal gene has a MAF $f_i$ and an effect size $\beta_i$.
+
+One simple genetic architecture could assume identical MAFs and identical $\beta_i$'s.
+
+```{r, eval=FALSE}
+f = rep(.25, n)    # Minor allele frequency (let's assume constant)
+beta = rep(1, n)   # Identical, arbitrary effect size for all genes
+```
+
+Another genetic architecture could assume a mixture of rare and common variants and a spectrum of $\beta_i$'s.
+
+```{r}
+f = rep(c(.01, .2), times=n/2) # Rare and common SNPs
+beta = 1:n         # Mixture of effect sizes
+```
+
+Note that the magnitude of the effect sizes $\beta_i$'s is determined up to a constant multiplier (so that `beta = rep(1, n)` and `beta = rep(10, n)` mean the same thing).
+
+We model a quantitative phenotype $Y$ through an additive relationship
+\[ Y = \sum \beta_i d_i + \epsilon \]
+where $d_i$ (0 or 1) denotes the $i$-th genotype (presence/absence of gene) $\epsilon$ is a normal distribution with a mean of zero and variance of $\sigma^2$; it captures the part of the phenotype that is determined by unaccounted-for variables (be they genetic, environmental or otherwise) as well as the part of the phenotype that is, for all intents and purposes, purely stochastic.
+\[\bar{Y} = \sum \beta_i f_i \quad
+  V(Y)    = \sum \beta_i f_i (1 - f_i) + \sigma^2 \]
+
+Narrow-sense heritability is given by \[ h^2 = \frac{\sum \beta_i f_i (1 - f_i)}{V(Y)} \]
+
+For this phenotype, we assume a fairly sizeable amount of heritability $h^2 = 50$% but other choices (20%, 10%) would be reasonable too but unsurprisingly more challenging to address.
+
+```{r}
+h2 = .5
+```
+
+The amount of noise, $\sigma^2$, can be determined based on the assumed value for $h^2$:
+\[ \sigma^2 = \frac{1 - h^2}{h^2} \Bigl( \sum \beta_i f_i (1 - f_i) \Bigl) \]
+
+```{r}
+vg = sum(beta^2 * f * (1 - f)) # Genetic variation
+s2 = (1 - h2)/h2 * vg          # \sigma^2
+vt = vg + s2                   # Total phenotypic variation
+sigma  = sqrt(s2)              # \sigma
+```
+
+Of course, other genetic architectures could be tested:
+
+* 8%, 16%, 32%, 64% heritability
+* .05, .1, .2, .4  MAF
+* 4, 8, 16, 32, 64 number of causal loci
+
+We assume $K = 223$.
+
+```{r}
+K = 223
+```
+
+Detection is based on a type~I error rate of $\alpha = .05$ or FDR 50%.
+
+```{r}
+alpha = .05
+fdr_thr = .5
+```
+
+## Simulations
+
+We perform $R$ replicates:
+
+```{r}
+R = 10000       # Number of replicates
+```
+
+Each replicate will build a matrix of genotypes and a phenotype including noise.  Genetic associations are sought using a simple $t$ test; the $p$ value is recorded.
+
+For each simulation, we report:
+
+* How many true hits are retrieved based on a Bonferroni correction
+* How many      hits are reported using the FDR threshold and
+* How many true hits are reported using the FDR threshold
+* The minimal and the maximal $p$ values
+
+```{r}
+p = numeric(n)  # Vector of n p-values
+
+sim = foreach(r=1:R, .combine=rbind) %dopar%
+  {
+    x = t(matrix(rbinom(n * K, size=1, prob=f), nrow=n))
+    yg = colSums(beta * t(x))
+    noise = rnorm(K, mean=0, sd=sigma)
+    y = yg + noise
+
+    for (j in 1:n) {
+        a = y[x[, j] == 0]
+        b = y[x[, j] == 1]
+        if (length(a) >=2 && length(b) >= 2) {
+            test = t.test(a, b)
+            p[j] = test$p.value
+        } else {
+            p[j] = 1
+        }
+    
+        fdr = p.adjust(c(p, runif(N - n)), method='fdr')
+        
+        fdr_true_detected = sum(which(fdr < fdr_thr) <= n)
+        
+        fdr_detected = sum(fdr < fdr_thr)
+    }
+    
+    c(minp=min(p),
+      maxp=max(p),
+      bonf_true=sum(p < alpha/N),
+      fdr_detect=fdr_detected,
+      fdr_true=fdr_true_detected,
+      h2=var(yg)/var(y))
+  }
+```
+
+## Analysis
+
+```{r}
+sim |>
+    as_tibble() |>
+    ggplot(aes(minp)) +
+    geom_histogram(bins=50, colour='black', fill='white') +
+    scale_x_log10() +
+    ggtitle('Distribution of the minimal p-value')
+```
+
+```{r}
+sim |>
+  as_tibble() |>
+  ggplot(aes(bonf_true, after_stat(density))) +
+  geom_histogram(binwidth=1, colour='black', fill='white') +
+  ggtitle('Number of true associations detected using a Bonferroni correction')  
+```
+
+Here is a table of the minimal number of associations that are likely to be found using Bonferroni:
+
+```{r}
+sim |>
+    as_tibble() |>
+    count(bonf_true) |>
+    arrange(desc(bonf_true)) |>
+    mutate(cum_pc=signif(100 * cumsum(n/sum(n)), digits=2)) |>
+    arrange(desc(cum_pc))
+```
+
+How many hits, in total (true or false positives), would come out of the FDR analysis:
+
+```{r}
+sim |>
+  as_tibble() |>
+  ggplot(aes(fdr_detect)) +
+  geom_histogram(binwidth=1, colour='black', fill='white')
+```
+
+How many true hits would come out of the FDR analysis:
+
+```{r}
+sim |>
+  as_tibble() |>
+  ggplot(aes(fdr_true)) +
+  geom_histogram(binwidth=1, colour='black', fill='white')
+```
+
+```{r}
+sim |>
+  as_tibble() |>
+  count(fdr_true) |>
+  arrange(desc(fdr_true)) |>
+  mutate(cum_pc=signif(100 * cumsum(n/sum(n)), digits=2)) |>
+  arrange(desc(cum_pc))
+```
